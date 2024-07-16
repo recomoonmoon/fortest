@@ -8,498 +8,346 @@ EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 See the Mulan PSL v2 for more details. */
 
-#include <benchmark/benchmark.h>
-#include <inttypes.h>
-#include <random>
+#include <string.h>
+#include <sstream>
+#include <filesystem>
+#include <utility>
 
-#include "common/lang/sstream.h"
-#define private public
 #define protected public
+#define private public
 #include "storage/table/table.h"
-#undef private
 #undef protected
+#undef private
 
-#include "common/log/log.h"
-#include "common/lang/chrono.h"
-#include "common/lang/stdexcept.h"
-#include "common/lang/memory.h"
-#include "common/math/integer_generator.h"
 #include "storage/buffer/disk_buffer_pool.h"
-#include "storage/common/condition_filter.h"
 #include "storage/record/record_manager.h"
 #include "storage/trx/vacuous_trx.h"
 #include "storage/clog/vacuous_log_handler.h"
+#include "storage/clog/disk_log_handler.h"
 #include "storage/buffer/double_write_buffer.h"
+#include "common/math/integer_generator.h"
+#include "common/thread/thread_pool_executor.h"
+#include "storage/clog/integrated_log_replayer.h"
+#include "gtest/gtest.h"
 
+using namespace std;
 using namespace common;
-using namespace benchmark;
 
-struct Stat
+class PaxRecordFileScannerWithParam : public testing::TestWithParam<int>
+{};
+
+TEST_P(PaxRecordFileScannerWithParam, test_file_iterator)
 {
-  int64_t insert_success_count = 0;
-  int64_t insert_other_count   = 0;
+  int               record_insert_num = GetParam();
+  VacuousLogHandler log_handler;
 
-  int64_t delete_success_count = 0;
-  int64_t not_exist_count      = 0;
-  int64_t delete_other_count   = 0;
+  const char *record_manager_file = "record_manager.bp";
+  filesystem::remove(record_manager_file);
 
-  int64_t scan_success_count     = 0;
-  int64_t scan_open_failed_count = 0;
-  int64_t mismatch_count         = 0;
-  int64_t scan_other_count       = 0;
-};
+  BufferPoolManager *bpm = new BufferPoolManager();
+  ASSERT_EQ(RC::SUCCESS, bpm->init(make_unique<VacuousDoubleWriteBuffer>()));
+  DiskBufferPool *bp = nullptr;
+  RC              rc = bpm->create_file(record_manager_file);
+  ASSERT_EQ(rc, RC::SUCCESS);
 
-struct TestRecord
+  rc = bpm->open_file(log_handler, record_manager_file, bp);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  TableMeta table_meta;
+  table_meta.fields_.resize(2);
+  table_meta.fields_[0].attr_type_ = AttrType::INTS;
+  table_meta.fields_[0].attr_len_  = 4;
+  table_meta.fields_[0].field_id_ = 0;
+  table_meta.fields_[1].attr_type_ = AttrType::INTS;
+  table_meta.fields_[1].attr_len_  = 4;
+  table_meta.fields_[1].field_id_ = 1;
+
+  RecordFileHandler file_handler(StorageFormat::PAX_FORMAT);
+  rc = file_handler.init(*bp, log_handler, &table_meta);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  VacuousTrx        trx;
+  ChunkFileScanner chunk_scanner;
+  RecordFileScanner record_scanner;
+  Table             table;
+  table.table_meta_.storage_format_ = StorageFormat::PAX_FORMAT;
+  // no record
+  // record iterator
+  rc = record_scanner.open_scan(&table, *bp, &trx, log_handler, ReadWriteMode::READ_ONLY, nullptr /*condition_filter*/);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  int    count = 0;
+  Record record;
+  while (OB_SUCC(rc = record_scanner.next(record))) {
+    count++;
+  }
+  if (rc == RC::RECORD_EOF) {
+    rc = RC::SUCCESS;
+  }
+  record_scanner.close_scan();
+  ASSERT_EQ(count, 0);
+
+  // chunk iterator
+  rc = chunk_scanner.open_scan_chunk(&table, *bp, log_handler, ReadWriteMode::READ_ONLY);
+  ASSERT_EQ(rc, RC::SUCCESS);
+  Chunk     chunk;
+  FieldMeta fm;
+  fm.init("col1", AttrType::INTS, 0, 4, true, 0);
+  auto col1 = std::make_unique<Column>(fm, 2048);
+  chunk.add_column(std::move(col1), 0);
+  count = 0;
+  while (OB_SUCC(rc = chunk_scanner.next_chunk(chunk))) {
+    count += chunk.rows();
+    chunk.reset_data();
+  }
+  ASSERT_EQ(rc, RC::RECORD_EOF);
+  ASSERT_EQ(count, 0);
+
+  // insert some records
+  char             record_data[8];
+  std::vector<RID> rids;
+  for (int i = 0; i < record_insert_num; i++) {
+    RID rid;
+    rc = file_handler.insert_record(record_data, sizeof(record_data), &rid);
+    ASSERT_EQ(rc, RC::SUCCESS);
+    rids.push_back(rid);
+  }
+
+  // record iterator
+  rc = record_scanner.open_scan(&table, *bp, &trx, log_handler, ReadWriteMode::READ_ONLY, nullptr /*condition_filter*/);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  count = 0;
+  while (OB_SUCC(rc = record_scanner.next(record))) {
+    count++;
+  }
+  ASSERT_EQ(RC::RECORD_EOF, rc);
+
+  record_scanner.close_scan();
+  ASSERT_EQ(count, rids.size());
+
+  // chunk iterator
+  rc = chunk_scanner.open_scan_chunk(&table, *bp, log_handler, ReadWriteMode::READ_ONLY);
+  ASSERT_EQ(rc, RC::SUCCESS);
+  chunk.reset_data();
+  count = 0;
+  while (OB_SUCC(rc = chunk_scanner.next_chunk(chunk))) {
+    count += chunk.rows();
+    chunk.reset_data();
+  }
+  ASSERT_EQ(rc, RC::RECORD_EOF);
+  ASSERT_EQ(count, record_insert_num);
+
+  // delete some records
+  for (int i = 0; i < record_insert_num; i += 2) {
+    rc = file_handler.delete_record(&rids[i]);
+    ASSERT_EQ(rc, RC::SUCCESS);
+  }
+
+  // record iterator
+  rc = record_scanner.open_scan(&table, *bp, &trx, log_handler, ReadWriteMode::READ_ONLY, nullptr /*condition_filter*/);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  count = 0;
+  while (OB_SUCC(rc = record_scanner.next(record))) {
+    count++;
+  }
+  ASSERT_EQ(RC::RECORD_EOF, rc);
+
+  record_scanner.close_scan();
+  ASSERT_EQ(count, rids.size() / 2);
+
+  // chunk iterator
+  rc = chunk_scanner.open_scan_chunk(&table, *bp, log_handler, ReadWriteMode::READ_ONLY);
+  ASSERT_EQ(rc, RC::SUCCESS);
+  chunk.reset_data();
+  count = 0;
+  while (OB_SUCC(rc = chunk_scanner.next_chunk(chunk))) {
+    count += chunk.rows();
+    chunk.reset_data();
+  }
+  ASSERT_EQ(rc, RC::RECORD_EOF);
+  ASSERT_EQ(count, rids.size() / 2);
+
+  bpm->close_file(record_manager_file);
+  delete bpm;
+}
+
+class PaxPageHandlerTestWithParam : public testing::TestWithParam<int>
+{};
+
+TEST_P(PaxPageHandlerTestWithParam, PaxPageHandler)
 {
-  char fields[15];
-};
+  int               record_num = GetParam();
+  VacuousLogHandler log_handler;
 
-class TestConditionFilter : public ConditionFilter
-{
-public:
-  TestConditionFilter(int32_t begin, int32_t end) : begin_(begin), end_(end) {}
+  const char *record_manager_file = "record_manager.bp";
+  ::remove(record_manager_file);
 
-  bool filter(const Record &rec) const override
-  {
-    const char *data  = rec.data();
-    int32_t     value = *(int32_t *)data;
-    return value >= begin_ && value <= end_;
+  BufferPoolManager *bpm = new BufferPoolManager();
+  ASSERT_EQ(RC::SUCCESS, bpm->init(make_unique<VacuousDoubleWriteBuffer>()));
+  DiskBufferPool *bp = nullptr;
+  RC              rc = bpm->create_file(record_manager_file);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  rc = bpm->open_file(log_handler, record_manager_file, bp);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  Frame *frame = nullptr;
+  rc           = bp->allocate_page(&frame);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  const int          record_size        = 19;  // 4 + 4 + 4 + 7
+  RecordPageHandler *record_page_handle = new PaxRecordPageHandler();
+  TableMeta          table_meta;
+  table_meta.fields_.resize(4);
+  table_meta.fields_[0].attr_type_ = AttrType::INTS;
+  table_meta.fields_[0].attr_len_  = 4;
+  table_meta.fields_[0].field_id_ = 0;
+  table_meta.fields_[1].attr_type_ = AttrType::FLOATS;
+  table_meta.fields_[1].attr_len_  = 4;
+  table_meta.fields_[1].field_id_ = 1;
+  table_meta.fields_[2].attr_type_ = AttrType::CHARS;
+  table_meta.fields_[2].attr_len_  = 4;
+  table_meta.fields_[2].field_id_ = 2;
+  table_meta.fields_[3].attr_type_ = AttrType::CHARS;
+  table_meta.fields_[3].attr_len_  = 7;
+  table_meta.fields_[3].field_id_ = 3;
+
+  rc = record_page_handle->init_empty_page(*bp, log_handler, frame->page_num(), record_size, &table_meta);
+  ASSERT_EQ(rc, RC::SUCCESS);
+
+  RecordPageIterator iterator;
+  iterator.init(record_page_handle);
+
+  int    count = 0;
+  Record record;
+  while (iterator.has_next()) {
+    count++;
+    rc = iterator.next(record);
+    ASSERT_EQ(rc, RC::SUCCESS);
   }
+  ASSERT_EQ(count, 0);
 
-private:
-  int32_t begin_;
-  int32_t end_;
-};
-
-class BenchmarkBase : public Fixture
-{
-public:
-  BenchmarkBase() {}
-
-  virtual ~BenchmarkBase() {}
-
-  virtual string Name() const = 0;
-
-  string record_filename() const { return this->Name() + ".record"; }
-
-  virtual void SetUp(const State &state)
-  {
-    if (0 != state.thread_index()) {
-      return;
-    }
-
-    bpm_.init(make_unique<VacuousDoubleWriteBuffer>());
-
-    string log_name        = this->Name() + ".log";
-    string record_filename = this->record_filename();
-    LoggerFactory::init_default(log_name.c_str(), LOG_LEVEL_INFO);
-
-    ::remove(record_filename.c_str());
-
-    RC rc = bpm_.create_file(record_filename.c_str());
-    if (rc != RC::SUCCESS) {
-      LOG_WARN("failed to create record buffer pool file. filename=%s, rc=%s", record_filename.c_str(), strrc(rc));
-      throw runtime_error("failed to create record buffer pool file.");
-    }
-
-    rc = bpm_.open_file(log_handler_, record_filename.c_str(), buffer_pool_);
-    if (rc != RC::SUCCESS) {
-      LOG_WARN("failed to open record file. filename=%s, rc=%s", record_filename.c_str(), strrc(rc));
-      throw runtime_error("failed to open record file");
-    }
-    table_meta_ = new TableMeta;
-    table_meta_->fields_.resize(2);
-    table_meta_->fields_[0].attr_type_ = AttrType::INTS;
-    table_meta_->fields_[0].attr_len_  = 4;
-    table_meta_->fields_[0].field_id_  = 0;
-    table_meta_->fields_[1].attr_type_ = AttrType::CHARS;
-    table_meta_->fields_[1].attr_len_  = 11;
-    table_meta_->fields_[1].field_id_  = 1;
-    handler_                           = new RecordFileHandler(StorageFormat::PAX_FORMAT);
-    rc                                 = handler_->init(*buffer_pool_, log_handler_, table_meta_);
-    if (rc != RC::SUCCESS) {
-      LOG_WARN("failed to init record file handler. rc=%s", strrc(rc));
-      throw runtime_error("failed to init record file handler");
-    }
-    LOG_INFO("test %s setup done. threads=%d, thread index=%d", 
-             this->Name().c_str(), state.threads(), state.thread_index());
-  }
-
-  virtual void TearDown(const State &state)
-  {
-    if (0 != state.thread_index()) {
-      return;
-    }
-
-    handler_->close();
-    delete handler_;
-    handler_ = nullptr;
-    delete table_meta_;
-    table_meta_ = nullptr;
-    // TODO 很怪，引入double write buffer后，必须要求先close buffer pool，再执行bpm.close_file。
-    // 以后必须修理好bpm、buffer pool、double write buffer之间的关系
-    buffer_pool_->close_file();
-    bpm_.close_file(this->record_filename().c_str());
-    buffer_pool_ = nullptr;
-    LOG_INFO("test %s teardown done. threads=%d, thread index=%d",
-        this->Name().c_str(),
-        state.threads(),
-        state.thread_index());
-  }
-
-  void FillUp(int32_t min, int32_t max, vector<RID> &rids)
-  {
-    rids.reserve(max - min);
-    RID             rid;
-    TestRecord      record;
-    vector<int32_t> record_values;
-    record_values.reserve(max - min);
-    for (int32_t value = min; value < max; ++value) {
-      record_values.push_back(value);
-    }
-
-    random_device rd;
-    mt19937       random_generator(rd());
-    shuffle(record_values.begin(), record_values.end(), random_generator);
-
-    for (int32_t record_value : record_values) {
-      memcpy(&record.fields[0], &record_value, sizeof(record_value));
-      [[maybe_unused]] RC rc = handler_->insert_record(reinterpret_cast<const char *>(&record), sizeof(record), &rid);
-      ASSERT(rc == RC::SUCCESS, "failed to insert record into record file. record value=%" PRIu32, record_value);
-      rids.push_back(rid);
-    }
-
-    LOG_INFO("fill up done. min=%" PRIu32 ", max=%" PRIu32 ", distance=%" PRIu32, min, max, (max - min));
-  }
-
-  uint32_t GetRangeMax(const State &state) const
-  {
-    int32_t max = static_cast<int32_t>(state.range(0) * 3);
-    if (max <= 0) {
-      max = INT32_MAX - 1;
-    }
-    return max;
-  }
-
-  void Insert(int32_t value, Stat &stat, RID &rid)
-  {
-    TestRecord record;
-    memcpy(&record.fields[0], &value, sizeof(value));
-
-    RC rc = handler_->insert_record(reinterpret_cast<const char *>(&record), sizeof(record), &rid);
-    switch (rc) {
-      case RC::SUCCESS: {
-        stat.insert_success_count++;
-      } break;
-      default: {
-        stat.insert_other_count++;
-      } break;
-    }
-  }
-
-  void Delete(const RID &rid, Stat &stat)
-  {
-    RC rc = handler_->delete_record(&rid);
-    switch (rc) {
-      case RC::SUCCESS: {
-        stat.delete_success_count++;
-      } break;
-      case RC::RECORD_NOT_EXIST: {
-        stat.not_exist_count++;
-      } break;
-      default: {
-        stat.delete_other_count++;
-      } break;
-    }
-  }
-
-  void Scan(int32_t begin, int32_t end, Stat &stat)
-  {
-    TestConditionFilter condition_filter(begin, end);
-    RecordFileScanner   scanner;
-    VacuousTrx          trx;
-    Table               table;
-    table.table_meta_.storage_format_ = StorageFormat::PAX_FORMAT;
-    RC rc = scanner.open_scan(&table, *buffer_pool_, &trx, log_handler_, ReadWriteMode::READ_ONLY, &condition_filter);
-    if (rc != RC::SUCCESS) {
-      stat.scan_open_failed_count++;
-    } else {
-      Record  record;
-      int32_t count = 0;
-      while (OB_SUCC(rc = scanner.next(record))) {
-        count++;
-      }
-
-      if (rc != RC::RECORD_EOF) {
-        stat.scan_other_count++;
-      } else if (count != (end - begin + 1)) {
-        stat.mismatch_count++;
-      } else {
-        stat.scan_success_count++;
-      }
-
-      scanner.close_scan();
-    }
-  }
-
-  void ScanChunk(Stat &stat)
-  {
-    ChunkFileScanner scanner;
-    Table            table;
-    table.table_meta_.storage_format_ = StorageFormat::PAX_FORMAT;
-    RC rc = scanner.open_scan_chunk(&table, *buffer_pool_, log_handler_, ReadWriteMode::READ_ONLY);
-    if (rc != RC::SUCCESS) {
-      stat.scan_open_failed_count++;
-    } else {
-      Chunk     chunk;
-      FieldMeta fm;
-      fm.init("col1", AttrType::INTS, 0, 4, true, 0);
-      auto col1 = make_unique<Column>(fm, 2048);
-      chunk.add_column(std::move(col1), 0);
-      while (OB_SUCC(rc = scanner.next_chunk(chunk))) {
-        chunk.reset_data();
-      }
-
-      if (rc != RC::RECORD_EOF) {
-        stat.scan_other_count++;
-      } else {
-        stat.scan_success_count++;
-      }
-
-      scanner.close_scan();
-    }
-  }
-
-protected:
-  BufferPoolManager  bpm_{512};
-  DiskBufferPool    *buffer_pool_ = nullptr;
-  RecordFileHandler *handler_     = nullptr;
-  VacuousLogHandler  log_handler_;
-  TableMeta         *table_meta_ = nullptr;
-  ;
-};
-
-////////////////////////////////////////////////////////////////////////////////
-
-struct DISABLED_InsertionBenchmark : public BenchmarkBase
-{
-  string Name() const override { return "insertion"; }
-};
-
-BENCHMARK_DEFINE_F(DISABLED_InsertionBenchmark, Insertion)(State &state)
-{
-  IntegerGenerator generator(1, 1 << 31);
-  Stat             stat;
-
+  char  buf[record_size];
+  int   int_base   = 122;
+  float float_base = 1.45;
+  memcpy(buf + 8, "12345678910", 4 + 7);
   RID rid;
-  for (auto _ : state) {
-    Insert(generator.next(), stat, rid);
+  for (int i = 0; i < record_num; i++) {
+    int   int_val   = i + int_base;
+    float float_val = i + float_base;
+    memcpy(buf, &int_val, sizeof(int));
+    memcpy(buf + 4, &float_val, sizeof(float));
+    rc = record_page_handle->insert_record(buf, &rid);
+    ASSERT_EQ(rc, RC::SUCCESS);
   }
 
-  state.counters["success"] = Counter(stat.insert_success_count, Counter::kIsRate);
-  state.counters["other"]   = Counter(stat.insert_other_count, Counter::kIsRate);
-}
+  count = 0;
+  iterator.init(record_page_handle);
+  while (iterator.has_next()) {
+    int   int_val   = count + int_base;
+    float float_val = count + float_base;
+    rc              = iterator.next(record);
+    ASSERT_EQ(memcmp(record.data(), &int_val, sizeof(int)), 0);
+    ASSERT_EQ(memcmp(record.data() + 4, &float_val, sizeof(float)), 0);
+    ASSERT_EQ(memcmp(record.data() + 8, "12345678910", 4 + 7), 0);
+    ASSERT_EQ(rc, RC::SUCCESS);
+    count++;
+  }
+  ASSERT_EQ(count, record_num);
 
-BENCHMARK_REGISTER_F(DISABLED_InsertionBenchmark, Insertion)->Threads(10);
+  Chunk     chunk1;
+  FieldMeta fm1, fm2, fm3, fm4;
+  fm1.init("col1", AttrType::INTS, 0, 4, true, 0);
+  fm2.init("col2", AttrType::FLOATS, 4, 4, true, 1);
+  fm3.init("col3", AttrType::CHARS, 8, 4, true, 2);
+  fm4.init("col4", AttrType::CHARS, 12, 7, true, 3);
+  auto col_1 = std::make_unique<Column>(fm1, 2048);
+  chunk1.add_column(std::move(col_1), 0);
+  auto col_2 = std::make_unique<Column>(fm2, 2048);
+  chunk1.add_column(std::move(col_2), 1);
+  auto col_3 = std::make_unique<Column>(fm3, 2048);
+  chunk1.add_column(std::move(col_3), 2);
+  auto col_4 = std::make_unique<Column>(fm4, 2048);
+  chunk1.add_column(std::move(col_4), 3);
+  rc = record_page_handle->get_chunk(chunk1);
+  ASSERT_EQ(rc, RC::SUCCESS);
+  ASSERT_EQ(chunk1.rows(), record_num);
+  for (int i = 0; i < record_num; i++) {
+    int   int_val   = i + int_base;
+    float float_val = i + float_base;
+    ASSERT_EQ(chunk1.get_value(0, i).get_int(), int_val);
+    ASSERT_EQ(chunk1.get_value(1, i).get_float(), float_val);
+    ASSERT_STREQ(chunk1.get_value(2, i).get_string().c_str(), "1234");
+    ASSERT_STREQ(chunk1.get_value(3, i).get_string().c_str(), "5678910");
+  }
 
-////////////////////////////////////////////////////////////////////////////////
+  Chunk     chunk2;
+  FieldMeta fm2_1;
+  fm2_1.init("col2", AttrType::FLOATS, 4, 4, true, 1);
+  auto col_2_1 = std::make_unique<Column>(fm2_1, 2048);
+  chunk2.add_column(std::move(col_2_1), 1);
+  rc = record_page_handle->get_chunk(chunk2);
+  ASSERT_EQ(rc, RC::SUCCESS);
+  ASSERT_EQ(chunk2.rows(), record_num);
+  for (int i = 0; i < record_num; i++) {
+    float float_val = i + float_base;
+    ASSERT_FLOAT_EQ(chunk2.get_value(0, i).get_float(), float_val);
+  }
 
-class DISABLED_DeletionBenchmark : public BenchmarkBase
-{
-public:
-  string Name() const override { return "deletion"; }
+  // delete record
+  IntegerGenerator generator(0, record_num - 1);
+  int delete_num = generator.next();
+  std::set<int> delete_slots;
+  for (int i = 0; i < delete_num; i++) {
 
-  void SetUp(const State &state) override
-  {
-    BenchmarkBase::SetUp(state);
-
-    if (0 != state.thread_index()) {
-      while (!setup_done_) {
-        this_thread::sleep_for(chrono::milliseconds(100));
-      }
-      return;
+    int slot_num = 0;
+    while (true) {
+      slot_num = generator.next();
+      if (delete_slots.find(slot_num) == delete_slots.end()) break;
     }
-
-    uint32_t max = GetRangeMax(state);
-    ASSERT(max > 0, "invalid argument count. %ld", state.range(0));
-    FillUp(0, max, rids_);
-    ASSERT(rids_.size() > 0, "invalid argument count. %ld", rids_.size());
-    setup_done_ = true;
+    RID del_rid(1, slot_num);
+    rc = record_page_handle->delete_record(&del_rid);
+    delete_slots.insert(slot_num);
+    ASSERT_EQ(rc, RC::SUCCESS);
   }
 
-protected:
-  // 从实际测试情况看，每个线程都会执行setup，但是它们操作的对象都是同一个
-  // 但是每个线程set up结束后，就会执行测试了。如果不等待的话，就会导致有些
-  // 线程访问的数据不是想要的结果
-  volatile bool setup_done_ = false;
-  vector<RID>   rids_;
-};
+  // get chunk
+  chunk1.reset_data();
+  record_page_handle->get_chunk(chunk1);
+  ASSERT_EQ(chunk1.rows(), record_num - delete_num);
 
-BENCHMARK_DEFINE_F(DISABLED_DeletionBenchmark, Deletion)(State &state)
-{
-  IntegerGenerator generator(0, static_cast<int>(rids_.size() - 1));
-  Stat             stat;
-
-  for (auto _ : state) {
-    int32_t value = generator.next();
-    RID     rid   = rids_[value];
-    Delete(rid, stat);
+  int col1_expected = (int_base + 0 + int_base + record_num - 1) * record_num /2;
+  int col1_actual   = 0;
+  for (int i = 0; i < chunk1.rows(); i++) {
+    col1_actual += chunk1.get_value(0, i).get_int();
+  }
+  for (auto it = delete_slots.begin(); it != delete_slots.end(); ++it) {
+    col1_actual += *it + int_base;
+  }
+  // check sum(col1)
+  ASSERT_EQ(col1_actual, col1_expected);
+  for (auto it = delete_slots.begin(); it != delete_slots.end(); ++it) {
+    RID get_rid(1, *it);
+    ASSERT_EQ(record_page_handle->get_record(get_rid, record), RC::RECORD_NOT_EXIST);
   }
 
-  state.counters["success"]   = Counter(stat.delete_success_count, Counter::kIsRate);
-  state.counters["not_exist"] = Counter(stat.not_exist_count, Counter::kIsRate);
-  state.counters["other"]     = Counter(stat.delete_other_count, Counter::kIsRate);
+  rc = record_page_handle->cleanup();
+  ASSERT_EQ(rc, RC::SUCCESS);
+  delete record_page_handle;
+  bpm->close_file(record_manager_file);
+  delete bpm;
 }
 
-BENCHMARK_REGISTER_F(DISABLED_DeletionBenchmark, Deletion)->Threads(10)->Arg(4 * 10000);
+INSTANTIATE_TEST_SUITE_P(PaxFileScannerTests, PaxRecordFileScannerWithParam, testing::Values(1, 10, 100, 1000, 2000, 10000));
 
-////////////////////////////////////////////////////////////////////////////////
+INSTANTIATE_TEST_SUITE_P(PaxPageTests, PaxPageHandlerTestWithParam, testing::Values(1, 10, 100, 337));
 
-class DISABLED_ScanBenchmark : public BenchmarkBase
+int main(int argc, char **argv)
 {
-public:
-  string Name() const override { return "scan"; }
-
-  void SetUp(const State &state) override
-  {
-    if (0 != state.thread_index()) {
-      return;
-    }
-
-    BenchmarkBase::SetUp(state);
-
-    int32_t max = state.range(0) * 3;
-    ASSERT(max > 0, "invalid argument count. %ld", state.range(0));
-    vector<RID> rids;
-    FillUp(0, max, rids);
-  }
-};
-
-BENCHMARK_DEFINE_F(DISABLED_ScanBenchmark, Scan)(State &state)
-{
-  int              max_range_size = 100;
-  uint32_t         max            = GetRangeMax(state);
-  IntegerGenerator begin_generator(1, max - max_range_size);
-  IntegerGenerator range_generator(1, max_range_size);
-  Stat             stat;
-
-  for (auto _ : state) {
-    int32_t begin = begin_generator.next();
-    int32_t end   = begin + range_generator.next();
-    Scan(begin, end, stat);
-  }
-
-  state.counters["success"]               = Counter(stat.scan_success_count, Counter::kIsRate);
-  state.counters["open_failed_count"]     = Counter(stat.scan_open_failed_count, Counter::kIsRate);
-  state.counters["mismatch_number_count"] = Counter(stat.mismatch_count, Counter::kIsRate);
-  state.counters["other"]                 = Counter(stat.scan_other_count, Counter::kIsRate);
+  testing::InitGoogleTest(&argc, argv);
+  filesystem::path log_filename = filesystem::path(argv[0]).filename();
+  LoggerFactory::init_default(log_filename.string() + ".log", LOG_LEVEL_TRACE);
+  return RUN_ALL_TESTS();
 }
-
-BENCHMARK_REGISTER_F(DISABLED_ScanBenchmark, Scan)->Threads(10)->Arg(4 * 10000);
-
-////////////////////////////////////////////////////////////////////////////////
-
-class DISABLED_ScanChunkBenchmark : public BenchmarkBase
-{
-public:
-  string Name() const override { return "scan_chunk"; }
-
-  void SetUp(const State &state) override
-  {
-    if (0 != state.thread_index()) {
-      return;
-    }
-
-    BenchmarkBase::SetUp(state);
-
-    int32_t max = state.range(0) * 3;
-    ASSERT(max > 0, "invalid argument count. %ld", state.range(0));
-    vector<RID> rids;
-    FillUp(0, max, rids);
-  }
-};
-
-BENCHMARK_DEFINE_F(DISABLED_ScanChunkBenchmark, ScanChunk)(State &state)
-{
-  Stat stat;
-  for (auto _ : state) {
-    ScanChunk(stat);
-  }
-
-  state.counters["success"]               = Counter(stat.scan_success_count, Counter::kIsRate);
-  state.counters["open_failed_count"]     = Counter(stat.scan_open_failed_count, Counter::kIsRate);
-  state.counters["mismatch_number_count"] = Counter(stat.mismatch_count, Counter::kIsRate);
-  state.counters["other"]                 = Counter(stat.scan_other_count, Counter::kIsRate);
-}
-
-BENCHMARK_REGISTER_F(DISABLED_ScanChunkBenchmark, ScanChunk)->Threads(10)->Arg(4 * 10000);
-
-////////////////////////////////////////////////////////////////////////////////
-
-struct DISABLED_MixtureBenchmark : public BenchmarkBase
-{
-  string Name() const override { return "mixture"; }
-};
-
-BENCHMARK_DEFINE_F(DISABLED_MixtureBenchmark, Mixture)(State &state)
-{
-  pair<int32_t, int32_t> data_range{0, GetRangeMax(state)};
-  pair<int32_t, int32_t> scan_range{1, 100};
-
-  IntegerGenerator data_generator(data_range.first, data_range.second);
-  IntegerGenerator scan_range_generator(scan_range.first, scan_range.second);
-  IntegerGenerator operation_generator(0, 3);
-
-  Stat stat;
-
-  vector<RID> rids;
-  for (auto _ : state) {
-    int operation_type = operation_generator.next();
-    switch (operation_type) {
-      case 0: {  // insert
-        int32_t value = data_generator.next();
-        RID     rid;
-        Insert(value, stat, rid);
-        if (rids.size() < 1000000) {
-          rids.push_back(rid);
-        }
-      } break;
-      case 1: {  // delete
-        int32_t index = data_generator.next();
-        if (!rids.empty()) {
-          index %= rids.size();
-          RID rid = rids[index];
-          rids.erase(rids.begin() + index);
-          Delete(rid, stat);
-        }
-      } break;
-      case 2: {  // scan
-        int32_t begin = data_generator.next();
-        int32_t end   = begin + scan_range_generator.next();
-        Scan(begin, end, stat);
-      } break;
-      case 3: {  // scan chunk
-        ScanChunk(stat);
-      } break;
-      default: {
-        ASSERT(false, "should not happen. operation=%ld", operation_type);
-      }
-    }
-  }
-
-  state.counters.insert({{"insert_success", Counter(stat.insert_success_count, Counter::kIsRate)},
-      {"insert_other", Counter(stat.insert_other_count, Counter::kIsRate)},
-      {"delete_success", Counter(stat.delete_success_count, Counter::kIsRate)},
-      {"delete_other", Counter(stat.delete_other_count, Counter::kIsRate)},
-      {"delete_not_exist", Counter(stat.not_exist_count, Counter::kIsRate)},
-      {"scan_success", Counter(stat.scan_success_count, Counter::kIsRate)},
-      {"scan_other", Counter(stat.scan_other_count, Counter::kIsRate)},
-      {"scan_mismatch", Counter(stat.mismatch_count, Counter::kIsRate)},
-      {"scan_open_failed", Counter(stat.scan_open_failed_count, Counter::kIsRate)}});
-}
-
-BENCHMARK_REGISTER_F(DISABLED_MixtureBenchmark, Mixture)->Threads(10)->Arg(4 * 10000);
-
-////////////////////////////////////////////////////////////////////////////////
-
-BENCHMARK_MAIN();

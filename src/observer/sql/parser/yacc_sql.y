@@ -531,6 +531,9 @@ expression:
       $$ = new StarExpr();
     }
     // your code here
+    | SUM LBRACE expression RBRACE {
+      $$ = create_arithmetic_expression(ArithmeticExpr::Type::SUM, $2, sql_string, &@$);
+    }
     ;
 
 rel_attr:
@@ -661,6 +664,9 @@ group_by:
     /* empty */
     {
       $$ = nullptr;
+    } | group by expression_list
+    {
+      $$ = $2;;
     }
     ;
 load_data_stmt:

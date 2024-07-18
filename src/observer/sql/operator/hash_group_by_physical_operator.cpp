@@ -48,7 +48,7 @@ RC HashGroupByPhysicalOperator::open(Trx *trx)
       return RC::INTERNAL;
     }
 
-    // 找到对应的group
+    // 找到对应的group，加入到groups_中
     GroupType *found_group = nullptr;
     rc                     = find_group(*child_tuple, found_group);
     if (OB_FAIL(rc)) {
@@ -56,7 +56,7 @@ RC HashGroupByPhysicalOperator::open(Trx *trx)
       return rc;
     }
 
-    // 计算需要做聚合的值
+    // 计算需要做聚合的值，通过调用child.next()每次取出一行
     group_value_expression_tuple.set_tuple(child_tuple);
 
     // 计算聚合值

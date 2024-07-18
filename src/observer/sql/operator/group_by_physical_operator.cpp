@@ -43,6 +43,11 @@ void GroupByPhysicalOperator::create_aggregator_list(AggregatorList &aggregator_
   });
 }
 
+// 针对一行数据，可能有很多字段都需要做聚合操作
+// 一个tuple存了这些需要做聚合操作的值
+// 比如一行有a, b, c三个字段，需要做sum(a), avg(b), count(c)三个聚合操作
+// 那么这个tuple就存了a, b, c三个值
+// 然后对这三个值分别做聚合操作
 RC GroupByPhysicalOperator::aggregate(AggregatorList &aggregator_list, const Tuple &tuple)
 {
   ASSERT(static_cast<int>(aggregator_list.size()) == tuple.cell_num(), 
@@ -71,6 +76,9 @@ RC GroupByPhysicalOperator::aggregate(AggregatorList &aggregator_list, const Tup
   return rc;
 }
 
+// 当所有需要做聚合的值都聚合完了之后，每个算子所存储的值就是最终的结果
+// evaluate将这些值取出来，放到一个tuple中
+// 同时，为了方便后续的操作，还需要将这些值对应哪张表的哪个字段的这些信息也存下来
 RC GroupByPhysicalOperator::evaluate(GroupValueType &group_value)
 {
   RC rc = RC::SUCCESS;

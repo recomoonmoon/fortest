@@ -21,15 +21,22 @@ class GroupByVecPhysicalOperator : public PhysicalOperator
 {
 public:
   GroupByVecPhysicalOperator(
-      std::vector<std::unique_ptr<Expression>> &&group_by_exprs, std::vector<Expression *> &&expressions){};
+      std::vector<std::unique_ptr<Expression>> &&group_by_exprs, std::vector<Expression *> &&expressions);
 
   virtual ~GroupByVecPhysicalOperator() = default;
 
   PhysicalOperatorType type() const override { return PhysicalOperatorType::GROUP_BY_VEC; }
 
-  RC open(Trx *trx) override { return RC::UNIMPLENMENT; }
-  RC next(Chunk &chunk) override { return RC::UNIMPLENMENT; }
-  RC close() override { return RC::UNIMPLENMENT; }
+  RC open(Trx *trx) override;
+  RC next(Chunk &chunk) override;
+  RC close() override;
 
 private:
+  std::vector<std::unique_ptr<Expression>> group_by_exprs_; // 分组表达式
+  std::vector<Expression *> aggregate_expressions_; // 聚合表达式
+  std::vector<Expression *> value_expressions_; // 聚合表达式的子计算表达式
+  StandardAggregateHashTable hash_table_; // 每个分组的聚合结果
+  StandardAggregateHashTable::Scanner *scanner_; // 扫描器
+  Chunk                     chunk_;
+  Chunk                     output_chunk_;
 };
